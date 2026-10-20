@@ -27,7 +27,7 @@ gl = types.SimpleNamespace(
     vm=types.SimpleNamespace(UserError=UserError, Return=type("Return", (), {})),
     nondet=types.SimpleNamespace(web=None, exec_prompt=None),
     eq_principle=types.SimpleNamespace(prompt_comparative=None),
-    block=types.SimpleNamespace(timestamp=0),
+    message_raw={"datetime": "1970-01-01T00:00:00.000000Z"},
     message=types.SimpleNamespace(sender_address=None, value=0),
 )
 mod = types.ModuleType("genlayer")
@@ -43,12 +43,24 @@ class FakeRecipient:
     def emit_transfer(self, value): sent.append((self.to, int(value)))
 eg._Recipient = FakeRecipient
 
+def _iso(epoch):
+    import datetime as _dt
+    return _dt.datetime.fromtimestamp(epoch, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+
+def test_now_matches_python_datetime():
+    import datetime as _dt
+    for epoch in [0, 951782400, 1_000_000, 1_789_000_000, 4_102_444_800]:
+        gl.message_raw = {"datetime": _iso(epoch)}
+        assert eg._now() == epoch, (epoch, eg._now())
+    gl.message_raw = {"datetime": "2026-09-26T20:06:34.271991Z"}
+    assert eg._now() == int(_dt.datetime(2026, 9, 26, 20, 6, 34, tzinfo=_dt.timezone.utc).timestamp())
+
 def as_(who, amt=0):
     sender["who"] = who
     value["amt"] = amt
     gl.message.sender_address = Addr(who)
     gl.message.value = amt
-    gl.block.timestamp = clock["now"]
+    gl.message_raw = {"datetime": _iso(clock["now"])}
 
 def fresh(window=3600):
     sent.clear()

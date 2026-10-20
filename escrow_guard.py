@@ -18,8 +18,25 @@ class _Recipient:
         pass
 
 
+def _days_from_civil(y: int, m: int, d: int) -> int:
+    """Days since 1970-01-01 for a proleptic Gregorian date (plain integer math)."""
+    y -= m <= 2
+    era = y // 400
+    yoe = y - era * 400
+    doy = (153 * (m + (-3 if m > 2 else 9)) + 2) // 5 + d - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+
+
 def _now() -> int:
-    return int(gl.block.timestamp)
+    """Current transaction time in Unix seconds. GenVM passes it as an ISO string
+    such as "2026-09-26T20:06:34.271991Z". Only the fixed 19-character prefix is
+    used, and the conversion is integer arithmetic, so every validator computes
+    the same value."""
+    raw = str(gl.message_raw["datetime"])[:19]
+    y, mo, d = int(raw[0:4]), int(raw[5:7]), int(raw[8:10])
+    hh, mm, ss = int(raw[11:13]), int(raw[14:16]), int(raw[17:19])
+    return _days_from_civil(y, mo, d) * 86400 + hh * 3600 + mm * 60 + ss
 
 
 class EscrowGuard(gl.Contract):
