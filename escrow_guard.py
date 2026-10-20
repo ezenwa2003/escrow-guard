@@ -4,9 +4,11 @@ from genlayer import *
 import json
 import typing
 
+MIN_WINDOW = 60             # 1 minute (use days in production)
+MAX_WINDOW = 2_592_000      # 30 days
 
-# Plain wallet addresses have no GenLayer code, so payouts go through an
-# EVM-style interface instead of treating the recipient as a GenLayer contract.
+
+# Plain wallets have no GenLayer code, so payouts use an EVM-style interface.
 @gl.evm.contract_interface
 class _Recipient:
     class View:
@@ -16,51 +18,64 @@ class _Recipient:
         pass
 
 
+def _now() -> int:
+    return int(gl.block.timestamp)
+
+
 class EscrowGuard(gl.Contract):
     """
-    Freelance escrow that holds real GEN and settles disputes with
-    validator consensus.
+    Freelance escrow that holds real GEN. Nothing stays locked forever.
 
     Stages:
       AWAITING_FUNDS -> FUNDED -> DELIVERED -> SETTLED
-                                     |
-                                     +-> DISPUTED -> SETTLED
+                          |            |
+                          |            +-> DISPUTED -> SETTLED
+                          |            |
+                          |            +-> (client silent past response window)
+                          |                 freelancer calls claim_unanswered -> SETTLED
+                          +-> (freelancer silent past delivery window)
+                               client calls reclaim_undelivered -> REFUNDED
 
-    1. The client funds the escrow (payable).
-    2. The freelancer submits a delivery note and a link to the work.
-    3. The client either approves (funds released to the freelancer) or
-       raises a dispute.
-    4. On dispute, validators read the agreed terms, the delivery note,
-       the live content of the delivery link, and the client's complaint,
-       then agree on a ruling. The escrow is paid out automatically.
+    Every deadline is set from the contract's own clock when the step happens.
+    Every transition checks the caller's role and the current stage before
+    money moves, and the stage is written before any transfer, so a payout
+    can only happen once.
     """
 
     client: Address
     freelancer: Address
     job_terms: str
+    window_seconds: u256
     stage: str
     amount: u256
+    delivery_deadline: u256
+    response_deadline: u256
+    dispute_deadline: u256
     delivery_note: str
     delivery_url: str
     complaint: str
     ruling: str
     reasoning: str
 
-    # NOTE: gl.message.sender_address is not used in __init__ (it can break
-    # deployment), so the client address is passed in as a parameter.
-    def __init__(self, client: str, freelancer: str, job_terms: str):
+    def __init__(self, client: str, freelancer: str, job_terms: str, window_seconds: int):
+        if not MIN_WINDOW <= window_seconds <= MAX_WINDOW:
+            raise gl.vm.UserError("[EXPECTED] window_seconds must be between 3600 and 2592000")
         self.client = Address(client)
         self.freelancer = Address(freelancer)
         self.job_terms = job_terms
+        self.window_seconds = u256(window_seconds)
         self.stage = "AWAITING_FUNDS"
         self.amount = u256(0)
+        self.delivery_deadline = u256(0)
+        self.response_deadline = u256(0)
+        self.dispute_deadline = u256(0)
         self.delivery_note = ""
         self.delivery_url = ""
         self.complaint = ""
         self.ruling = ""
         self.reasoning = ""
 
-    # ---------- small helpers ----------
+    # ---------- helpers ----------
 
     def _only(self, who: Address, label: str) -> None:
         if gl.message.sender_address.as_hex != who.as_hex:
@@ -73,7 +88,6 @@ class EscrowGuard(gl.Contract):
             )
 
     def _pay(self, to: Address) -> None:
-        # State is already marked SETTLED before this is called.
         _Recipient(to).emit_transfer(value=self.amount)
 
     # ---------- stage 1: funding ----------
@@ -86,6 +100,7 @@ class EscrowGuard(gl.Contract):
         if value == 0:
             raise gl.vm.UserError("[EXPECTED] Attach a non-zero amount of GEN")
         self.amount = value
+        self.delivery_deadline = u256(_now() + int(self.window_seconds))
         self.stage = "FUNDED"
         return "Escrow funded"
 
@@ -95,12 +110,17 @@ class EscrowGuard(gl.Contract):
     def submit_delivery(self, delivery_note: str, delivery_url: str) -> str:
         self._only(self.freelancer, "freelancer")
         self._in_stage("FUNDED")
+        if _now() > int(self.delivery_deadline):
+            raise gl.vm.UserError("[EXPECTED] The delivery window has passed")
+        if not delivery_note.strip():
+            raise gl.vm.UserError("[EXPECTED] Describe what you delivered")
         self.delivery_note = delivery_note
         self.delivery_url = delivery_url
+        self.response_deadline = u256(_now() + int(self.window_seconds))
         self.stage = "DELIVERED"
         return "Delivery submitted"
 
-    # ---------- stage 3a: happy path ----------
+    # ---------- stage 3: client responds ----------
 
     @gl.public.write
     def approve_release(self) -> str:
@@ -112,15 +132,66 @@ class EscrowGuard(gl.Contract):
         self._pay(self.freelancer)
         return "Funds released to freelancer"
 
-    # ---------- stage 3b: dispute ----------
-
     @gl.public.write
     def raise_dispute(self, complaint: str) -> str:
         self._only(self.client, "client")
         self._in_stage("DELIVERED")
+        if _now() > int(self.response_deadline):
+            raise gl.vm.UserError("[EXPECTED] The response window has passed. The freelancer can now claim payment.")
+        if not complaint.strip():
+            raise gl.vm.UserError("[EXPECTED] Say what is wrong with the delivery")
         self.complaint = complaint
+        self.dispute_deadline = u256(_now() + int(self.window_seconds))
         self.stage = "DISPUTED"
         return "Dispute raised"
+
+    # ---------- recovery paths ----------
+
+    @gl.public.write
+    def reclaim_undelivered(self) -> str:
+        """Client gets the money back when the freelancer never delivered in time."""
+        self._only(self.client, "client")
+        self._in_stage("FUNDED")
+        if _now() <= int(self.delivery_deadline):
+            raise gl.vm.UserError("[EXPECTED] The delivery window is still open")
+        self.ruling = "REFUND_CLIENT"
+        self.reasoning = "No delivery was submitted before the deadline."
+        self.stage = "REFUNDED"
+        self._pay(self.client)
+        return "Refunded to client"
+
+    @gl.public.write
+    def claim_unanswered(self) -> str:
+        """Freelancer gets paid when the client never approved or disputed in time."""
+        self._only(self.freelancer, "freelancer")
+        self._in_stage("DELIVERED")
+        if _now() <= int(self.response_deadline):
+            raise gl.vm.UserError("[EXPECTED] The client's response window is still open")
+        self.ruling = "PAY_FREELANCER"
+        self.reasoning = "The client did not approve or dispute before the deadline."
+        self.stage = "SETTLED"
+        self._pay(self.freelancer)
+        return "Funds released to freelancer"
+
+    # ---------- stage 4: validators rule on a dispute ----------
+
+    @gl.public.write
+    def settle_stalled_dispute(self) -> str:
+        """Safety valve: if validators have not ruled by the dispute deadline,
+        either party can close the case and the escrow returns to the client.
+        Without this, a dispute the validators can never agree on would lock
+        the money forever."""
+        caller = gl.message.sender_address.as_hex
+        if caller != self.client.as_hex and caller != self.freelancer.as_hex:
+            raise gl.vm.UserError("[EXPECTED] Only the client or freelancer can do this")
+        self._in_stage("DISPUTED")
+        if _now() <= int(self.dispute_deadline):
+            raise gl.vm.UserError("[EXPECTED] The validators still have time to rule")
+        self.ruling = "REFUND_CLIENT"
+        self.reasoning = "Validators did not reach a ruling before the deadline, so the escrow returned to the client."
+        self.stage = "SETTLED"
+        self._pay(self.client)
+        return "Escrow returned to client"
 
     @gl.public.write
     def resolve_dispute(self) -> typing.Any:
@@ -212,8 +283,12 @@ This result should be perfectly parsable by a JSON parser without errors.
             "client": self.client.as_hex,
             "freelancer": self.freelancer.as_hex,
             "job_terms": self.job_terms,
+            "window_seconds": str(int(self.window_seconds)),
             "stage": self.stage,
             "amount": str(int(self.amount)),
+            "delivery_deadline": str(int(self.delivery_deadline)),
+            "response_deadline": str(int(self.response_deadline)),
+            "dispute_deadline": str(int(self.dispute_deadline)),
             "delivery_note": self.delivery_note,
             "delivery_url": self.delivery_url,
             "complaint": self.complaint,
